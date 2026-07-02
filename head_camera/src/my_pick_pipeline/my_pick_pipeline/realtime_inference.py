@@ -420,7 +420,7 @@ class PlaneAndCornerEstimator:
 
         # 低速平滑以防单帧计算抖动 (只有当U轴未发生90度跳变时才平滑)
         if self.prev_u_vec is not None and np.dot(u, self.prev_u_vec) > 0.5:
-            alpha = 0.4
+            alpha = 0.6
             u = (1.0 - alpha) * self.prev_u_vec + alpha * u
             u = u - np.dot(u, n_hat) * n_hat
             u = u / (np.linalg.norm(u) + 1e-8)

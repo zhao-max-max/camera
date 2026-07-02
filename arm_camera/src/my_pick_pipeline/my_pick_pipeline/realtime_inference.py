@@ -19,6 +19,12 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 import math
 
+from rclpy.duration import Duration
+from rclpy.time import Time
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from tf2_geometry_msgs import do_transform_pose
+
 # 适配现成 C++ 代码里的 robot_msgs
 from robot_msgs.srv import GetPickPos
 
@@ -44,6 +50,13 @@ MIN_INLIERS = 280
 MAX_POINTS_FOR_RANSAC = 25000
 
 POSE_STALE_SEC = 1.0  # 缓存位姿有效期（秒），超过此时间视为过期
+
+# ===== TF 变换配置 =====
+# 相机端直接把检测位姿变换到 world 系再缓存/发布。
+# 物体在 world 系静止，检测瞬间冻结的 world 坐标不随相机后续移动失效。
+TARGET_FRAME = "world"          # 目标坐标系（arm 的 world）
+SOURCE_FRAME = "camera_link"    # 相机检测结果所在坐标系
+TF_TIMEOUT_SEC = 0.2            # lookup_transform 等待超时
 
 def rotmat2quat(R):
     m00, m01, m02 = R[0,0], R[0,1], R[0,2]
@@ -125,6 +138,25 @@ class PlaneAndCornerEstimator:
         out = np.zeros_like(mask_u8, dtype=np.uint8)
         out[labels == largest_label] = 255
         return out
+
+    @staticmethod
+    def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
+        """填补掩膜内部封闭空洞。
+
+        用漫水法从边界外的背景开始填充：能被外部背景连通到的才是“真背景”，
+        剩下没被连通到的黑洞即为内部空洞，将其并回前景。
+        """
+        if not np.any(mask_u8):
+            return mask_u8
+        h, w = mask_u8.shape[:2]
+        # floodFill 需要比图像大一圈的掩码
+        ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        flood = mask_u8.copy()
+        # 从 (0,0) 背景点漫水，标记所有与外部连通的背景
+        cv2.floodFill(flood, ff_mask, (0, 0), 255)
+        # flood 中仍为 0 的像素 = 内部空洞
+        holes = cv2.bitwise_not(flood)
+        return cv2.bitwise_or(mask_u8, holes)
 
     def extract_mask_points_3d(self, mask_u8: np.ndarray, depth_image: np.ndarray):
         ys, xs = np.where(mask_u8 > 0)
@@ -325,6 +357,29 @@ class PlaneAndCornerEstimator:
                 pts3d.append(np.asarray(p, dtype=np.float64))
         return pts3d
 
+    def classify_two_corners(self, corners_3d, plane_normal):
+        """恰好 2 个可见角点时，判定二者是相邻还是对角。
+
+        依据平面内间距：正方形相邻角点间距≈s，对角角点间距≈s√2（区分度~41%）。
+        就近判定，边界在 s·(1+√2)/2 ≈ 1.207·s；间距明显超出合理范围时返回
+        'unknown'（类别边长选错/角点误检），交由上层走兜底逻辑。
+
+        返回: 'adjacent' | 'diagonal' | 'unknown'
+        """
+        if corners_3d is None or len(corners_3d) != 2 or plane_normal is None:
+            return 'unknown'
+        n_hat = plane_normal / (np.linalg.norm(plane_normal) + 1e-8)
+        e = corners_3d[1] - corners_3d[0]
+        e = e - np.dot(e, n_hat) * n_hat
+        d = float(np.linalg.norm(e))
+        s = EXPECTED_SIDE_M
+        if d < 1e-4:
+            return 'unknown'
+        # 合理带：[0.75s, s√2 + 0.25s]，出界即兜底
+        if d < 0.75 * s or d > s * math.sqrt(2.0) + 0.25 * s:
+            return 'unknown'
+        return 'diagonal' if abs(d - s * math.sqrt(2.0)) < abs(d - s) else 'adjacent'
+
     def estimate_uv_axes(self, corners_3d, plane_normal):
         n_hat = plane_normal / (np.linalg.norm(plane_normal) + 1e-8)
 
@@ -353,6 +408,17 @@ class PlaneAndCornerEstimator:
 
             if best_pair is not None:
                 u = best_pair / (np.linalg.norm(best_pair) + 1e-8)
+
+        # 恰好 2 个角点且判为对角：连线是对角线，绕法向量转 45° 回到边方向。
+        # 正方形对角线平分两边夹角，±45° 给出两条互相垂直的边，取其一即可，
+        # 后续 v = n×u 和"顺时针最小角"规范化会自动定死唯一朝向。
+        if u is not None and self.classify_two_corners(corners_3d, plane_normal) == 'diagonal':
+            e_diag = u - np.dot(u, n_hat) * n_hat
+            le = np.linalg.norm(e_diag)
+            if le > 1e-8:
+                e_diag = e_diag / le
+                w = np.cross(n_hat, e_diag)
+                u = (e_diag + w) / math.sqrt(2.0)
 
         if u is None:
             u = self.prev_u_vec if self.prev_u_vec is not None else ref
@@ -438,57 +504,62 @@ class PlaneAndCornerEstimator:
             D = A + B - C
             center_uv = (A + B + C + D) / 4.0
         elif n == 2:
-            # 约束：两点只按”相邻边点”处理（不存在对角点情况）
             A, B = uv_pts[0], uv_pts[1]
             mid = 0.5 * (A + B)
-            t = B - A
-            nt = np.linalg.norm(t)
-            if nt < 1e-8:
+            kind = self.classify_two_corners(corners_3d, plane_normal)
+            if kind == 'diagonal':
+                # 对角：正方形对角线互相平分，中心就是中点，无方向歧义
                 center_uv = mid
             else:
-                t = t / nt
-                n2 = np.array([-t[1], t[0]], dtype=np.float64)
-                c1 = mid + 0.5 * EXPECTED_SIDE_M * n2
-                c2 = mid - 0.5 * EXPECTED_SIDE_M * n2
-
-                # ===== 旧逻辑：仅用可见掩膜质心距离消歧（质心贴边/出框时不可靠，已注释）=====
-                # if mask_centroid_uv is not None:
-                #     # 仅使用当前帧掩膜质心消歧：选离质心更近的候选
-                #     d1 = np.linalg.norm(c1 - mask_centroid_uv)
-                #     d2 = np.linalg.norm(c2 - mask_centroid_uv)
-                #     center_uv = c1 if d1 <= d2 else c2
-                # else:
-                #     center_uv = c1 if np.linalg.norm(c1) <= np.linalg.norm(c2) else c2
-
-                # ===== 新逻辑：掩膜多数像素投票决定 AB 哪一侧是中心侧 =====
-                # 可见上表面一定铺在 AB 朝向中心的那一侧。统计掩膜像素相对 mid
-                # 沿 n2 的符号，多数票决定方向。即使真实中心出框、只剩贴 AB 的窄带，
-                # 这条窄带也 100% 在中心侧，投票干净。
-                side = 0.0
-                if mask_u8 is not None and plane_normal is not None:
-                    ys_m, xs_m = np.where(mask_u8 > 0)
-                    stride = max(1, len(xs_m) // 2000)  # 控制采样量
-                    acc = 0.0
-                    for mx, my in zip(xs_m[::stride], ys_m[::stride]):
-                        p = self.ray_plane_point(float(mx), float(my), plane_origin, plane_normal)
-                        if p is None:
-                            continue
-                        d = p - plane_origin
-                        uv = np.array([np.dot(d, axis_u), np.dot(d, axis_v)], dtype=np.float64)
-                        acc += np.sign(np.dot(uv - mid, n2))
-                    side = acc
-
-                if side > 0:
-                    center_uv = c1            # 多数像素在 n2 正向 → c1 侧
-                elif side < 0:
-                    center_uv = c2
-                elif mask_centroid_uv is not None:
-                    # 投票打平/无掩膜信息：退回质心距离
-                    d1 = np.linalg.norm(c1 - mask_centroid_uv)
-                    d2 = np.linalg.norm(c2 - mask_centroid_uv)
-                    center_uv = c1 if d1 <= d2 else c2
+                # 相邻（或 unknown 兜底）：中点沿垂线偏移半边长，方向用掩膜像素投票消歧
+                t = B - A
+                nt = np.linalg.norm(t)
+                if nt < 1e-8:
+                    center_uv = mid
                 else:
-                    center_uv = c1 if np.linalg.norm(c1) <= np.linalg.norm(c2) else c2
+                    t = t / nt
+                    n2 = np.array([-t[1], t[0]], dtype=np.float64)
+                    c1 = mid + 0.5 * EXPECTED_SIDE_M * n2
+                    c2 = mid - 0.5 * EXPECTED_SIDE_M * n2
+
+                    # ===== 旧逻辑：仅用可见掩膜质心距离消歧（质心贴边/出框时不可靠，已注释）=====
+                    # if mask_centroid_uv is not None:
+                    #     # 仅使用当前帧掩膜质心消歧：选离质心更近的候选
+                    #     d1 = np.linalg.norm(c1 - mask_centroid_uv)
+                    #     d2 = np.linalg.norm(c2 - mask_centroid_uv)
+                    #     center_uv = c1 if d1 <= d2 else c2
+                    # else:
+                    #     center_uv = c1 if np.linalg.norm(c1) <= np.linalg.norm(c2) else c2
+
+                    # ===== 新逻辑：掩膜多数像素投票决定 AB 哪一侧是中心侧 =====
+                    # 可见上表面一定铺在 AB 朝向中心的那一侧。统计掩膜像素相对 mid
+                    # 沿 n2 的符号，多数票决定方向。即使真实中心出框、只剩贴 AB 的窄带，
+                    # 这条窄带也 100% 在中心侧，投票干净。
+                    side = 0.0
+                    if mask_u8 is not None and plane_normal is not None:
+                        ys_m, xs_m = np.where(mask_u8 > 0)
+                        stride = max(1, len(xs_m) // 2000)  # 控制采样量
+                        acc = 0.0
+                        for mx, my in zip(xs_m[::stride], ys_m[::stride]):
+                            p = self.ray_plane_point(float(mx), float(my), plane_origin, plane_normal)
+                            if p is None:
+                                continue
+                            d = p - plane_origin
+                            uv = np.array([np.dot(d, axis_u), np.dot(d, axis_v)], dtype=np.float64)
+                            acc += np.sign(np.dot(uv - mid, n2))
+                        side = acc
+
+                    if side > 0:
+                        center_uv = c1            # 多数像素在 n2 正向 → c1 侧
+                    elif side < 0:
+                        center_uv = c2
+                    elif mask_centroid_uv is not None:
+                        # 投票打平/无掩膜信息：退回质心距离
+                        d1 = np.linalg.norm(c1 - mask_centroid_uv)
+                        d2 = np.linalg.norm(c2 - mask_centroid_uv)
+                        center_uv = c1 if d1 <= d2 else c2
+                    else:
+                        center_uv = c1 if np.linalg.norm(c1) <= np.linalg.norm(c2) else c2
         else:  # n == 1
             # 单角点：从角点分别沿 U/V 方向偏移半边长，四种组合里选最合理中心
             corner = uv_pts[0]
@@ -573,7 +644,8 @@ def get_largest_mask_from_result(result, thresh=MASK_THRESH):
         return None
     masks = result.masks.data.cpu().numpy()
     merged = (np.any(masks > thresh, axis=0).astype(np.uint8) * 255)
-    return PlaneAndCornerEstimator.largest_component(merged)
+    largest = PlaneAndCornerEstimator.largest_component(merged)
+    return PlaneAndCornerEstimator.fill_holes(largest)
 
 
 def main(args=None):
@@ -610,6 +682,15 @@ def main(args=None):
     # 创建服务端，服务名完全匹配现有 C++ 的请求 "get_pick_pos"
     srv = node.create_service(GetPickPos, 'get_pick_pos', handle_get_pick_pose)
 
+    # TF：监听 arm control_node 广播的 world→Link_4(动态,100Hz) 和 Link_4→camera_link(静态)。
+    # spin_thread=True：TF 用独立线程接收——否则单线程主循环里 YOLO(CPU,数百 ms)会饿死
+    #   订阅回调，导致 buffer 最新 TF 恒定滞后约一个推理周期(≈1s)，按捕获时刻查必然
+    #   "extrapolation into the future"。独立线程让 buffer 始终最新，capture_stamp 精确命中。
+    # buffer 保存历史(默认 10s)，用捕获时刻查询得到"拍到物体那一帧"的相机姿态而非最新姿态，
+    # 这样推理延迟期间相机移动也不会引入 world 坐标漂移。
+    tf_buffer = Buffer()
+    tf_listener = TransformListener(tf_buffer, node, spin_thread=True)
+
     cam = RealSenseCamera()
     model = YOLO(MODEL_PATH)
     estimator = PlaneAndCornerEstimator(cam.intr, cam.depth_scale)
@@ -624,6 +705,10 @@ def main(args=None):
             color, depth = cam.read()
             if color is None:
                 continue
+
+            # 捕获瞬间就记下时间戳：后续 YOLO 推理(CPU 上数百 ms)期间相机可能移动，
+            # 必须用这个时刻去查 TF，才对应"拍到物体那一帧"的相机姿态。
+            capture_stamp = node.get_clock().now()
 
             result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
             mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
@@ -663,7 +748,7 @@ def main(args=None):
 
                         center_3d, _ = estimator.compute_center_from_corner_count(corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
                         if center_3d is not None:
-                            print(f"Center3D: X={center_3d[0]:.4f}  Y={center_3d[1]:.4f}  Z={center_3d[2]:.4f}  visible_corners={len(corners_3d)}  min_angle={min_angle:.1f}°")
+                            print(f"[DETECT camera_link] X={center_3d[0]:.4f}  Y={center_3d[1]:.4f}  Z={center_3d[2]:.4f}  visible_corners={len(corners_3d)}  min_angle={min_angle:.1f}°")
                             
                             # 基于 U、V 和平面法向量构建 3x3 旋转矩阵
                             # X轴=U方向，Y轴=V方向，Z轴=平面法向量(指向相机的反向)
@@ -672,17 +757,52 @@ def main(args=None):
                             q = rotmat2quat(R)
 
                             pose_msg = PoseStamped()
-                            pose_msg.header.stamp = node.get_clock().now().to_msg()
-                            pose_msg.header.frame_id = "camera_link"
-                            
+                            pose_msg.header.stamp = capture_stamp.to_msg()
+                            pose_msg.header.frame_id = SOURCE_FRAME
+
                             pose_msg.pose.position.x = float(center_3d[0])
                             pose_msg.pose.position.y = float(center_3d[1])
                             pose_msg.pose.position.z = float(center_3d[2])
-                            
+
                             pose_msg.pose.orientation.x = float(q[0])
                             pose_msg.pose.orientation.y = float(q[1])
                             pose_msg.pose.orientation.z = float(q[2])
                             pose_msg.pose.orientation.w = float(q[3])
+
+                            # 检测瞬间用捕获时间戳把位姿变换到 world 系。
+                            # 首选 exact：按 capture_stamp 精确查——TF 用独立线程接收(spin_thread=True)，
+                            #   buffer 始终最新，能命中"拍到物体那一帧"的相机姿态 → 运动中零漂移。
+                            # 降级 latest：极端情况(某帧 TF 恰好尚未覆盖 capture_stamp)退回最新 TF，
+                            #   等同 arm1 原先的 TimePointZero，仍能拿到 world 坐标。
+                            # 兜底 none：TF 完全不可用(arm 未启动) → 保留 camera_link，由 arm1 端变换。
+                            transformed = False
+                            for query_time, tag in ((capture_stamp, "exact"), (Time(), "latest")):
+                                try:
+                                    tf = tf_buffer.lookup_transform(
+                                        TARGET_FRAME, SOURCE_FRAME, query_time,
+                                        timeout=Duration(seconds=TF_TIMEOUT_SEC))
+                                    world_pose = do_transform_pose(pose_msg.pose, tf)
+                                    pose_msg.pose = world_pose
+                                    pose_msg.header.frame_id = TARGET_FRAME
+                                    tf_mode = tag
+                                    transformed = True
+                                    break
+                                except Exception as e:
+                                    last_tf_err = e
+                            if not transformed:
+                                tf_mode = "none"
+                                node.get_logger().warn(
+                                    f"TF {TARGET_FRAME}<-{SOURCE_FRAME} unavailable "
+                                    f"({last_tf_err}); keeping {SOURCE_FRAME} frame")
+
+                            # 实时输出最终对外的位姿：frame=world 表示已变换成世界系；
+                            # frame=camera_link 表示 TF 未就绪走了兜底（还是相机系）。
+                            # tf_mode: exact=按捕获时刻(零漂移,理想) / latest=用最新TF(降级) / none=兜底
+                            p = pose_msg.pose.position
+                            o = pose_msg.pose.orientation
+                            print(f"[POSE] frame={pose_msg.header.frame_id:<11} tf={tf_mode:<6} "
+                                  f"pos=({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f})  "
+                                  f"quat=({o.x:+.3f}, {o.y:+.3f}, {o.z:+.3f}, {o.w:+.3f})")
 
                             pose_pub.publish(pose_msg)
 
