@@ -30,14 +30,14 @@ from robot_msgs.srv import GetPickPos
 
 
 # ===== 配置 =====
-MODEL_PATH = "/home/zyy/task/arm/camera/arm_camera/best6.27.pt"
+MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__), "best6.27.pt"))
 CONFIDENCE = 0.45
 IOU = 0.5
 # DEVICE=0
 DEVICE = "cpu"  # 修改为强制使用 cpu 避免 CUDA 报错
 
 CAM_W, CAM_H, CAM_FPS = 640, 480, 30
-CAMERA_SERIAL = "043322075459"          #"043322075459"  # 填入相机序列号，如 "123456789"；留空则自动选第一个,213622078104
+CAMERA_SERIAL = os.environ.get("CAMERA_SERIAL", "")  # 由 run_neweyes.sh --1/--2 传入
 MASK_THRESH = 0.5
 EXPECTED_SIDE_M = 0.25
 
@@ -658,25 +658,112 @@ def main(args=None):
     node = rclpy.create_node('surface_center_estimator')
     pose_pub = node.create_publisher(PoseStamped, '/surface_pose', 10)
 
-    # 缓存位姿状态，供服务回调使用
+    # 缓存状态，供服务回调和显示循环使用
     global_state = {
         'pose': None,
-        'last_success_time': 0.0,  # time.monotonic() 时间戳
+        'last_success_time': 0.0,
+        'vis': None,
     }
 
-    # 定义服务回调函数
+    # 定义服务回调函数：收到请求时才进行一次推理
     def handle_get_pick_pose(request, response):
-        age = time.monotonic() - global_state['last_success_time']
-        if global_state['pose'] is not None and age < POSE_STALE_SEC:
-            response.pick_pose = global_state['pose']
-            response.success = True
-            node.get_logger().info(
-                f'Service called for {request.object_name}: returned cached pose (age={age:.2f}s).')
-        else:
+        node.get_logger().info(f'Service called for {request.object_name}: running inference...')
+        color, depth = cam.read()
+        if color is None:
             response.pick_pose = PoseStamped()
             response.success = False
-            node.get_logger().warn(
-                f'Service called for {request.object_name}: no valid pose (age={age:.2f}s).')
+            node.get_logger().warn('Service: failed to read camera frame.')
+            return response
+
+        capture_stamp = node.get_clock().now()
+        result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
+        mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
+
+        vis = color.copy()
+        corners = []
+        center_3d = None
+        axis_u, axis_v, normal = None, None, None
+
+        if mask_u8 is not None:
+            pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
+            if pts3d is not None:
+                plane = estimator.ransac_plane(pts3d)
+                if plane is not None:
+                    origin, normal = plane
+                    corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
+                    corners = estimator.temporal_stabilize_corners(corners)
+                    corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
+                    axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
+
+                    x_axis_ref = np.array([1.0, 0.0, 0.0])
+                    angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
+                    angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
+                    min_angle = min(angle_u, angle_v)
+
+                    ys_m, xs_m = np.where(mask_u8 > 0)
+                    cx_px = float(np.mean(xs_m))
+                    cy_px = float(np.mean(ys_m))
+                    centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
+                    mask_centroid_uv = None
+                    if centroid_3d is not None:
+                        dc = centroid_3d - origin
+                        mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
+
+                    center_3d, _ = estimator.compute_center_from_corner_count(
+                        corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
+
+                    if center_3d is not None:
+                        n_hat = normal / (np.linalg.norm(normal) + 1e-8)
+                        R = np.column_stack((axis_u, axis_v, n_hat))
+                        q = rotmat2quat(R)
+
+                        pose_msg = PoseStamped()
+                        pose_msg.header.stamp = capture_stamp.to_msg()
+                        pose_msg.header.frame_id = SOURCE_FRAME
+                        pose_msg.pose.position.x = float(center_3d[0])
+                        pose_msg.pose.position.y = float(center_3d[1])
+                        pose_msg.pose.position.z = float(center_3d[2])
+                        pose_msg.pose.orientation.x = float(q[0])
+                        pose_msg.pose.orientation.y = float(q[1])
+                        pose_msg.pose.orientation.z = float(q[2])
+                        pose_msg.pose.orientation.w = float(q[3])
+
+                        transformed = False
+                        last_tf_err = None
+                        for query_time, tag in ((capture_stamp, "exact"), (Time(), "latest")):
+                            try:
+                                tf = tf_buffer.lookup_transform(
+                                    TARGET_FRAME, SOURCE_FRAME, query_time,
+                                    timeout=Duration(seconds=TF_TIMEOUT_SEC))
+                                world_pose = do_transform_pose(pose_msg.pose, tf)
+                                pose_msg.pose = world_pose
+                                pose_msg.header.frame_id = TARGET_FRAME
+                                transformed = True
+                                break
+                            except Exception as e:
+                                last_tf_err = e
+                        if not transformed:
+                            node.get_logger().warn(
+                                f"TF {TARGET_FRAME}<-{SOURCE_FRAME} unavailable ({last_tf_err}); keeping {SOURCE_FRAME} frame")
+
+                        pose_pub.publish(pose_msg)
+                        global_state['pose'] = pose_msg
+                        global_state['last_success_time'] = time.monotonic()
+
+                        vis = estimator.draw_mask_overlay(vis, mask_u8)
+                        vis = estimator.draw_corners(vis, corners)
+                        vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
+                        global_state['vis'] = vis
+
+                        response.pick_pose = pose_msg
+                        response.success = True
+                        node.get_logger().info(
+                            f'Service: inference OK, corners={len(corners_3d)}, min_angle={min_angle:.1f}°')
+                        return response
+
+        response.pick_pose = PoseStamped()
+        response.success = False
+        node.get_logger().warn('Service: inference produced no valid pose.')
         return response
 
     # 创建服务端，服务名完全匹配现有 C++ 的请求 "get_pick_pos"
@@ -695,134 +782,27 @@ def main(args=None):
     model = YOLO(MODEL_PATH)
     estimator = PlaneAndCornerEstimator(cam.intr, cam.depth_scale)
 
-    print("\nCorner-only mode (3D enhanced). Press q to quit.")
+    print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+
+    VIS_DISPLAY_SEC = 3.0  # 推理结果展示时长，之后恢复实时画面
 
     try:
         while rclpy.ok():
-            # 处理 ROS 2 回调（响应外界对该服务的请求）
-            rclpy.spin_once(node, timeout_sec=0.005)
-
-            color, depth = cam.read()
-            if color is None:
-                continue
-
-            # 捕获瞬间就记下时间戳：后续 YOLO 推理(CPU 上数百 ms)期间相机可能移动，
-            # 必须用这个时刻去查 TF，才对应"拍到物体那一帧"的相机姿态。
-            capture_stamp = node.get_clock().now()
-
-            result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
-            mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
-
-            vis = color.copy()
-            corners = []
-            center_3d = None
-            axis_u, axis_v = None, None
-            if mask_u8 is not None:
-                pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
-                if pts3d is not None:
-                    plane = estimator.ransac_plane(pts3d)
-                    if plane is not None:
-                        origin, normal = plane
-                        corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
-                        corners = estimator.temporal_stabilize_corners(corners)
-
-                        corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
-                        axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
-
-                        # 计算相机X轴(1, 0, 0)与 U、V 轴的锐角夹角
-                        x_axis_ref = np.array([1.0, 0.0, 0.0])
-                        angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
-                        angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
-                        min_angle = min(angle_u, angle_v)
-
-                        # 计算当前帧掩膜质心并投影到 UV 平面，用于中心消歧
-                        ys_m, xs_m = np.where(mask_u8 > 0)
-                        cx_px = float(np.mean(xs_m))
-                        cy_px = float(np.mean(ys_m))
-                        centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
-                        if centroid_3d is not None:
-                            dc = centroid_3d - origin
-                            mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
-                        else:
-                            mask_centroid_uv = None
-
-                        center_3d, _ = estimator.compute_center_from_corner_count(corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
-                        if center_3d is not None:
-                            print(f"[DETECT camera_link] X={center_3d[0]:.4f}  Y={center_3d[1]:.4f}  Z={center_3d[2]:.4f}  visible_corners={len(corners_3d)}  min_angle={min_angle:.1f}°")
-                            
-                            # 基于 U、V 和平面法向量构建 3x3 旋转矩阵
-                            # X轴=U方向，Y轴=V方向，Z轴=平面法向量(指向相机的反向)
-                            n_hat = normal / (np.linalg.norm(normal) + 1e-8)
-                            R = np.column_stack((axis_u, axis_v, n_hat))
-                            q = rotmat2quat(R)
-
-                            pose_msg = PoseStamped()
-                            pose_msg.header.stamp = capture_stamp.to_msg()
-                            pose_msg.header.frame_id = SOURCE_FRAME
-
-                            pose_msg.pose.position.x = float(center_3d[0])
-                            pose_msg.pose.position.y = float(center_3d[1])
-                            pose_msg.pose.position.z = float(center_3d[2])
-
-                            pose_msg.pose.orientation.x = float(q[0])
-                            pose_msg.pose.orientation.y = float(q[1])
-                            pose_msg.pose.orientation.z = float(q[2])
-                            pose_msg.pose.orientation.w = float(q[3])
-
-                            # 检测瞬间用捕获时间戳把位姿变换到 world 系。
-                            # 首选 exact：按 capture_stamp 精确查——TF 用独立线程接收(spin_thread=True)，
-                            #   buffer 始终最新，能命中"拍到物体那一帧"的相机姿态 → 运动中零漂移。
-                            # 降级 latest：极端情况(某帧 TF 恰好尚未覆盖 capture_stamp)退回最新 TF，
-                            #   等同 arm1 原先的 TimePointZero，仍能拿到 world 坐标。
-                            # 兜底 none：TF 完全不可用(arm 未启动) → 保留 camera_link，由 arm1 端变换。
-                            transformed = False
-                            for query_time, tag in ((capture_stamp, "exact"), (Time(), "latest")):
-                                try:
-                                    tf = tf_buffer.lookup_transform(
-                                        TARGET_FRAME, SOURCE_FRAME, query_time,
-                                        timeout=Duration(seconds=TF_TIMEOUT_SEC))
-                                    world_pose = do_transform_pose(pose_msg.pose, tf)
-                                    pose_msg.pose = world_pose
-                                    pose_msg.header.frame_id = TARGET_FRAME
-                                    tf_mode = tag
-                                    transformed = True
-                                    break
-                                except Exception as e:
-                                    last_tf_err = e
-                            if not transformed:
-                                tf_mode = "none"
-                                node.get_logger().warn(
-                                    f"TF {TARGET_FRAME}<-{SOURCE_FRAME} unavailable "
-                                    f"({last_tf_err}); keeping {SOURCE_FRAME} frame")
-
-                            # 实时输出最终对外的位姿：frame=world 表示已变换成世界系；
-                            # frame=camera_link 表示 TF 未就绪走了兜底（还是相机系）。
-                            # tf_mode: exact=按捕获时刻(零漂移,理想) / latest=用最新TF(降级) / none=兜底
-                            p = pose_msg.pose.position
-                            o = pose_msg.pose.orientation
-                            print(f"[POSE] frame={pose_msg.header.frame_id:<11} tf={tf_mode:<6} "
-                                  f"pos=({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f})  "
-                                  f"quat=({o.x:+.3f}, {o.y:+.3f}, {o.z:+.3f}, {o.w:+.3f})")
-
-                            pose_pub.publish(pose_msg)
-
-                            # 更新全局缓存，供服务直接返回同一份结果
-                            global_state['pose'] = pose_msg
-                            global_state['last_success_time'] = time.monotonic()
-
-                vis = estimator.draw_mask_overlay(vis, mask_u8)
-                vis = estimator.draw_corners(vis, corners)
-
-                # 放到最后画，确保中心点和UV轴不会被掩膜覆盖
-                if center_3d is not None and axis_u is not None and axis_v is not None:
-                    vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
+            rclpy.spin_once(node, timeout_sec=0.02)
 
             if not os.environ.get('HEADLESS'):
-                cv2.imshow("camera: Mask Visible Right-Angle Corners", vis)
+                color, _ = cam.read()
+                if color is not None:
+                    age = time.monotonic() - global_state['last_success_time']
+                    if global_state['vis'] is not None and age < VIS_DISPLAY_SEC:
+                        vis = global_state['vis']
+                    else:
+                        vis = color
+                    cv2.imshow("camera: Mask Visible Right-Angle Corners", vis)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             else:
-                time.sleep(0.001)
+                time.sleep(0.02)
 
     finally:
         cam.stop()

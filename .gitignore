@@ -17,6 +17,11 @@
 *.py[cod]
 *.egg-info/
 
+# Virtual environment
+.venv/
+venv/
+env/
+
 # Local notes that should not be pushed
 arm_camera/注意md
 head_camera/注意.txt

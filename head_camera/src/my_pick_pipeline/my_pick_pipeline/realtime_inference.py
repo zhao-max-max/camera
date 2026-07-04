@@ -31,14 +31,14 @@ from robot_msgs.srv import GetPlacePos
 
 
 # ===== 配置 =====
-MODEL_PATH = "/home/zyy/task/arm/camera/head_camera/src/best.pt"
+MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__), "best.pt"))
 CONFIDENCE = 0.45
 IOU = 0.5
 # DEVICE=0
 DEVICE = "cpu"  # 修改为强制使用 cpu 避免 CUDA 报错
 
 CAM_W, CAM_H, CAM_FPS = 640, 480, 30
-CAMERA_SERIAL = "043322075459"  # 填入相机序列号；留空则自动选第一个
+CAMERA_SERIAL = os.environ.get("CAMERA_SERIAL", "")  # 由 run_neweyes.sh --1/--2 传入
 MASK_THRESH = 0.5
 
 # 类别 -> 物理边长(米)。类别 id 来自模型: {0: 'red-box', 1: 'red-space'}
@@ -632,25 +632,97 @@ def main(args=None):
     node = rclpy.create_node('head_surface_center_estimator')
     pose_pub = node.create_publisher(PoseStamped, '/head_surface_pose', 10)
 
-    # 缓存位姿状态，供服务回调使用
+    # 缓存状态，供服务回调和显示循环使用
     global_state = {
         'pose': None,
-        'last_success_time': 0.0,  # time.monotonic() 时间戳
+        'last_success_time': 0.0,
+        'vis': None,
     }
 
-    # 定义服务回调函数
+    # 定义服务回调函数：收到请求时才进行一次推理
     def handle_get_place_pose(request, response):
-        age = time.monotonic() - global_state['last_success_time']
-        if global_state['pose'] is not None and age < POSE_STALE_SEC:
-            response.place_pose = global_state['pose']
-            response.success = True
-            node.get_logger().info(
-                f'Service called for {request.frame_name}: returned cached pose (age={age:.2f}s).')
-        else:
+        node.get_logger().info(f'Service called for {request.frame_name}: running inference...')
+        color, depth = cam.read()
+        if color is None:
             response.place_pose = PoseStamped()
             response.success = False
-            node.get_logger().warn(
-                f'Service called for {request.frame_name}: no valid pose (age={age:.2f}s).')
+            node.get_logger().warn('Service: failed to read camera frame.')
+            return response
+
+        result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
+        mask_u8, cls_id = select_mask_by_class(result, MASK_THRESH)
+
+        vis = color.copy()
+        corners = []
+        center_3d = None
+        axis_u, axis_v, normal = None, None, None
+        cls_label = ""
+
+        if mask_u8 is not None:
+            estimator.expected_side_m = CLASS_SIDE_M.get(cls_id, 0.25)
+            cls_label = f"{CLASS_NAME.get(cls_id, '?')} side={estimator.expected_side_m:.2f}m"
+
+            pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
+            if pts3d is not None:
+                plane = estimator.ransac_plane(pts3d)
+                if plane is not None:
+                    origin, normal = plane
+                    corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
+                    corners = estimator.temporal_stabilize_corners(corners)
+                    corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
+                    axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
+
+                    x_axis_ref = np.array([1.0, 0.0, 0.0])
+                    angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
+                    angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
+                    min_angle = min(angle_u, angle_v)
+
+                    ys_m, xs_m = np.where(mask_u8 > 0)
+                    cx_px = float(np.mean(xs_m))
+                    cy_px = float(np.mean(ys_m))
+                    centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
+                    mask_centroid_uv = None
+                    if centroid_3d is not None:
+                        dc = centroid_3d - origin
+                        mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
+
+                    center_3d, _ = estimator.compute_center_from_corner_count(
+                        corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
+
+                    if center_3d is not None:
+                        n_hat = normal / (np.linalg.norm(normal) + 1e-8)
+                        R = np.column_stack((axis_u, axis_v, n_hat))
+                        q = rotmat2quat(R)
+
+                        pose_msg = PoseStamped()
+                        pose_msg.header.stamp = node.get_clock().now().to_msg()
+                        pose_msg.header.frame_id = "dog_camera_link"
+                        pose_msg.pose.position.x = float(center_3d[0])
+                        pose_msg.pose.position.y = float(center_3d[1])
+                        pose_msg.pose.position.z = float(center_3d[2])
+                        pose_msg.pose.orientation.x = float(q[0])
+                        pose_msg.pose.orientation.y = float(q[1])
+                        pose_msg.pose.orientation.z = float(q[2])
+                        pose_msg.pose.orientation.w = float(q[3])
+
+                        pose_pub.publish(pose_msg)
+                        global_state['pose'] = pose_msg
+                        global_state['last_success_time'] = time.monotonic()
+
+                        vis = estimator.draw_mask_overlay(vis, mask_u8)
+                        vis = estimator.draw_corners(vis, corners, label_text=cls_label)
+                        vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
+                        global_state['vis'] = vis
+
+                        response.place_pose = pose_msg
+                        response.success = True
+                        node.get_logger().info(
+                            f'Service: inference OK [{CLASS_NAME.get(cls_id,"?")}] corners={len(corners_3d)}, min_angle={min_angle:.1f}°')
+                        return response
+
+        response.place_pose = PoseStamped()
+        response.success = False
+        node.get_logger().warn('Service: inference produced no valid pose.')
         return response
 
     srv = node.create_service(GetPlacePos, 'get_place_pos', handle_get_place_pose)
@@ -659,97 +731,23 @@ def main(args=None):
     model = YOLO(MODEL_PATH)
     estimator = PlaneAndCornerEstimator(cam.intr, cam.depth_scale)
 
-    print("\nTwo-class mode (red-box / red-space) + ROS2. Press q to quit.")
+    print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+
+    VIS_DISPLAY_SEC = 3.0  # 推理结果展示时长，之后恢复实时画面
 
     try:
         while rclpy.ok():
-            # 处理 ROS 2 回调（响应外界对该服务的请求）
-            rclpy.spin_once(node, timeout_sec=0.005)
+            rclpy.spin_once(node, timeout_sec=0.02)
 
-            color, depth = cam.read()
-            if color is None:
-                continue
-
-            result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
-            mask_u8, cls_id = select_mask_by_class(result, MASK_THRESH)
-
-            vis = color.copy()
-            corners = []
-            center_3d = None
-            axis_u, axis_v = None, None
-            cls_label = ""
-            if mask_u8 is not None:
-                # 关键：按命中类别切换物理边长
-                estimator.expected_side_m = CLASS_SIDE_M.get(cls_id, 0.25)
-                cls_label = f"{CLASS_NAME.get(cls_id, '?')} side={estimator.expected_side_m:.2f}m"
-
-                pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
-                if pts3d is not None:
-                    plane = estimator.ransac_plane(pts3d)
-                    if plane is not None:
-                        origin, normal = plane
-                        corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
-                        corners = estimator.temporal_stabilize_corners(corners)
-
-                        corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
-                        axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
-
-                        # 计算相机X轴(1, 0, 0)与 U、V 轴的锐角夹角
-                        x_axis_ref = np.array([1.0, 0.0, 0.0])
-                        angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
-                        angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
-                        min_angle = min(angle_u, angle_v)
-
-                        # 计算当前帧掩膜质心并投影到 UV 平面，用于中心消歧
-                        ys_m, xs_m = np.where(mask_u8 > 0)
-                        cx_px = float(np.mean(xs_m))
-                        cy_px = float(np.mean(ys_m))
-                        centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
-                        if centroid_3d is not None:
-                            dc = centroid_3d - origin
-                            mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
-                        else:
-                            mask_centroid_uv = None
-
-                        center_3d, _ = estimator.compute_center_from_corner_count(corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
-                        if center_3d is not None:
-                            print(f"[{CLASS_NAME.get(cls_id, '?')}] Center3D: X={center_3d[0]:.4f}  Y={center_3d[1]:.4f}  Z={center_3d[2]:.4f}  side={estimator.expected_side_m:.2f}m  visible_corners={len(corners_3d)}  min_angle={min_angle:.1f}°")
-
-                            # 基于 U、V 和平面法向量构建 3x3 旋转矩阵
-                            # X轴=U方向，Y轴=V方向，Z轴=平面法向量(指向相机的反向)
-                            n_hat = normal / (np.linalg.norm(normal) + 1e-8)
-                            R = np.column_stack((axis_u, axis_v, n_hat))
-                            q = rotmat2quat(R)
-
-                            pose_msg = PoseStamped()
-                            pose_msg.header.stamp = node.get_clock().now().to_msg()
-                            pose_msg.header.frame_id = "dog_camera_link"
-
-                            pose_msg.pose.position.x = float(center_3d[0])
-                            pose_msg.pose.position.y = float(center_3d[1])
-                            pose_msg.pose.position.z = float(center_3d[2])
-
-                            pose_msg.pose.orientation.x = float(q[0])
-                            pose_msg.pose.orientation.y = float(q[1])
-                            pose_msg.pose.orientation.z = float(q[2])
-                            pose_msg.pose.orientation.w = float(q[3])
-
-                            pose_pub.publish(pose_msg)
-
-                            # 更新全局缓存，供服务直接返回同一份结果
-                            global_state['pose'] = pose_msg
-                            global_state['last_success_time'] = time.monotonic()
-
-                vis = estimator.draw_mask_overlay(vis, mask_u8)
-                vis = estimator.draw_corners(vis, corners, label_text=cls_label)
-
-                # 放到最后画，确保中心点和UV轴不会被掩膜覆盖
-                if center_3d is not None and axis_u is not None and axis_v is not None:
-                    vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
-
-            cv2.imshow("head_camera: Two-class Mask Visible Right-Angle Corners", vis)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            color, _ = cam.read()
+            if color is not None:
+                age = time.monotonic() - global_state['last_success_time']
+                if global_state['vis'] is not None and age < VIS_DISPLAY_SEC:
+                    vis = global_state['vis']
+                else:
+                    vis = color
+                cv2.imshow("head_camera: Two-class Mask Visible Right-Angle Corners", vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     finally:
