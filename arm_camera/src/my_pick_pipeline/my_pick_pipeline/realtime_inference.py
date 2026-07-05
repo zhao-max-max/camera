@@ -676,7 +676,9 @@ def main(args=None):
             return response
 
         capture_stamp = node.get_clock().now()
+        t0 = time.monotonic()
         result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
+        infer_ms = (time.monotonic() - t0) * 1000
         mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
 
         vis = color.copy()
@@ -758,7 +760,10 @@ def main(args=None):
                         response.pick_pose = pose_msg
                         response.success = True
                         node.get_logger().info(
-                            f'Service: inference OK, corners={len(corners_3d)}, min_angle={min_angle:.1f}°')
+                            f'Service: inference OK | '
+                            f'time={infer_ms:.0f}ms | '
+                            f'xyz=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}) | '
+                            f'corners={len(corners_3d)} | min_angle={min_angle:.1f}°')
                         return response
 
         response.pick_pose = PoseStamped()
@@ -784,7 +789,7 @@ def main(args=None):
 
     print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
 
-    VIS_DISPLAY_SEC = 3.0  # 推理结果展示时长，之后恢复实时画面
+    VIS_DISPLAY_SEC = 0.8  # 推理结果展示时长，之后恢复实时画面
 
     try:
         while rclpy.ok():

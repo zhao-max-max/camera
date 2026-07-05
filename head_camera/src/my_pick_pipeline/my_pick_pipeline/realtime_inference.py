@@ -649,7 +649,9 @@ def main(args=None):
             node.get_logger().warn('Service: failed to read camera frame.')
             return response
 
+        t0 = time.monotonic()
         result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
+        infer_ms = (time.monotonic() - t0) * 1000
         mask_u8, cls_id = select_mask_by_class(result, MASK_THRESH)
 
         vis = color.copy()
@@ -717,7 +719,10 @@ def main(args=None):
                         response.place_pose = pose_msg
                         response.success = True
                         node.get_logger().info(
-                            f'Service: inference OK [{CLASS_NAME.get(cls_id,"?")}] corners={len(corners_3d)}, min_angle={min_angle:.1f}°')
+                            f'Service: inference OK | '
+                            f'time={infer_ms:.0f}ms | '
+                            f'xyz=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}) | '
+                            f'[{CLASS_NAME.get(cls_id,"?")}] corners={len(corners_3d)} | min_angle={min_angle:.1f}°')
                         return response
 
         response.place_pose = PoseStamped()
@@ -733,7 +738,7 @@ def main(args=None):
 
     print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
 
-    VIS_DISPLAY_SEC = 3.0  # 推理结果展示时长，之后恢复实时画面
+    VIS_DISPLAY_SEC = 0.8  # 推理结果展示时长，之后恢复实时画面
 
     try:
         while rclpy.ok():
