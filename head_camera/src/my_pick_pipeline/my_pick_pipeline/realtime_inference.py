@@ -16,13 +16,16 @@
 """
 
 import os
+import sys
 import time
+import argparse
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 from ultralytics import YOLO
 
 import rclpy
+from rclpy.utilities import remove_ros_args
 from geometry_msgs.msg import PoseStamped
 import math
 
@@ -59,6 +62,15 @@ MIN_INLIERS = 280
 MAX_POINTS_FOR_RANSAC = 25000
 
 POSE_STALE_SEC = 1.0  # 缓存位姿有效期（秒），超过此时间视为过期
+
+
+def parse_cli_args():
+    """默认实时推理；--required 切换为收到服务请求才推理一次。"""
+    argv = remove_ros_args(args=sys.argv)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--required', action='store_true',
+                        help='按需推理；不加则默认持续实时推理')
+    return parser.parse_args(argv[1:])
 
 
 def rotmat2quat(R):
@@ -623,6 +635,8 @@ def select_mask_by_class(result, thresh=MASK_THRESH):
 
 
 def main(args=None):
+    cli_args = parse_cli_args()
+
     if not os.path.exists(MODEL_PATH):
         print(f"✗ model not found: {MODEL_PATH}")
         return
@@ -639,16 +653,7 @@ def main(args=None):
         'vis': None,
     }
 
-    # 定义服务回调函数：收到请求时才进行一次推理
-    def handle_get_place_pose(request, response):
-        node.get_logger().info(f'Service called for {request.frame_name}: running inference...')
-        color, depth = cam.read()
-        if color is None:
-            response.place_pose = PoseStamped()
-            response.success = False
-            node.get_logger().warn('Service: failed to read camera frame.')
-            return response
-
+    def run_inference(color, depth, capture_stamp):
         t0 = time.monotonic()
         result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
         infer_ms = (time.monotonic() - t0) * 1000
@@ -697,7 +702,7 @@ def main(args=None):
                         q = rotmat2quat(R)
 
                         pose_msg = PoseStamped()
-                        pose_msg.header.stamp = node.get_clock().now().to_msg()
+                        pose_msg.header.stamp = capture_stamp.to_msg()
                         pose_msg.header.frame_id = "dog_camera_link"
                         pose_msg.pose.position.x = float(center_3d[0])
                         pose_msg.pose.position.y = float(center_3d[1])
@@ -716,14 +721,46 @@ def main(args=None):
                         vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
                         global_state['vis'] = vis
 
-                        response.place_pose = pose_msg
-                        response.success = True
                         node.get_logger().info(
-                            f'Service: inference OK | '
-                            f'time={infer_ms:.0f}ms | '
+                            f'Inference OK | time={infer_ms:.0f}ms | '
                             f'xyz=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}) | '
                             f'[{CLASS_NAME.get(cls_id,"?")}] corners={len(corners_3d)} | min_angle={min_angle:.1f}°')
-                        return response
+                        return pose_msg, vis
+
+        return None, None
+
+    # 定义服务回调函数：
+    # - 实时模式(默认)：推理已在主循环里持续进行，服务只读取最近一次缓存位姿。
+    # - 按需模式(--required)：收到请求时读一帧、跑一次 run_inference。
+    def handle_get_place_pose(request, response):
+        if not cli_args.required:
+            age = time.monotonic() - global_state['last_success_time']
+            if global_state['pose'] is not None and age < POSE_STALE_SEC:
+                response.place_pose = global_state['pose']
+                response.success = True
+                node.get_logger().info(
+                    f'Service called for {request.frame_name}: returning cached pose (age={age:.2f}s)')
+            else:
+                response.place_pose = PoseStamped()
+                response.success = False
+                node.get_logger().warn(
+                    f'Service called for {request.frame_name}: no fresh cached pose (age={age:.2f}s)')
+            return response
+
+        node.get_logger().info(f'Service called for {request.frame_name}: running inference...')
+        color, depth = cam.read()
+        if color is None:
+            response.place_pose = PoseStamped()
+            response.success = False
+            node.get_logger().warn('Service: failed to read camera frame.')
+            return response
+
+        capture_stamp = node.get_clock().now()
+        pose_msg, _ = run_inference(color, depth, capture_stamp)
+        if pose_msg is not None:
+            response.place_pose = pose_msg
+            response.success = True
+            return response
 
         response.place_pose = PoseStamped()
         response.success = False
@@ -736,15 +773,23 @@ def main(args=None):
     model = YOLO(MODEL_PATH)
     estimator = PlaneAndCornerEstimator(cam.intr, cam.depth_scale)
 
-    print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+    if cli_args.required:
+        print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+    else:
+        print("\nRealtime inference mode: 持续推理，服务请求直接返回最新缓存位姿. Press q to quit.")
 
     VIS_DISPLAY_SEC = 0.8  # 推理结果展示时长，之后恢复实时画面
+    SPIN_TIMEOUT_SEC = 0.02 if cli_args.required else 0.005
 
     try:
         while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.02)
+            rclpy.spin_once(node, timeout_sec=SPIN_TIMEOUT_SEC)
 
-            color, _ = cam.read()
+            color, depth = cam.read()
+            if not cli_args.required and color is not None:
+                capture_stamp = node.get_clock().now()
+                run_inference(color, depth, capture_stamp)
+
             if color is not None:
                 age = time.monotonic() - global_state['last_success_time']
                 if global_state['vis'] is not None and age < VIS_DISPLAY_SEC:

@@ -4,6 +4,7 @@
 #   bash run_neweyes.sh --1         # 使用相机 213622078104
 #   bash run_neweyes.sh --2         # 使用相机 043322075459
 #   bash run_neweyes.sh --1 --build # 先编译再启动
+#   bash run_neweyes.sh --1 --required # 按需推理，收到服务请求才推理
 #   bash run_neweyes.sh -h          # 查看帮助
 set -euo pipefail
 
@@ -33,17 +34,20 @@ fi
 
 # ===== 帮助 =====
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  echo "用法: bash run_neweyes.sh --1|--2 [--build]"
+  echo "用法: bash run_neweyes.sh --1|--2 [--build] [--required]"
   echo "  --1      使用相机 ${SERIAL_1}"
   echo "  --2      使用相机 ${SERIAL_2}"
   echo "  --build  启动前先执行 colcon build"
+  echo "  --required 按需推理；不加则默认持续实时推理"
   echo "  环境变量 WS_DIR 可覆盖工作空间路径（默认脚本所在目录）"
   exit 0
 fi
 
 CAMERA_SERIAL=""
+REQUIRED_MODE=false
 for arg in "$@"; do
   [[ "$arg" == "--build" ]] && AUTO_BUILD=true
+  [[ "$arg" == "--required" ]] && REQUIRED_MODE=true
   [[ "$arg" == "--1" ]] && CAMERA_SERIAL="$SERIAL_1"
   [[ "$arg" == "--2" ]] && CAMERA_SERIAL="$SERIAL_2"
 done
@@ -89,4 +93,7 @@ ROBOT_MSGS_PATH="$WS_DIR/install/robot_msgs/local/lib/python3.10/dist-packages"
 export PYTHONPATH="$ROBOT_MSGS_PATH${PYTHONPATH:+:$PYTHONPATH}"
 export MODEL_PATH="$WS_DIR/src/best.pt"
 
-"$PYTHON_BIN" "$ENTRY_POINT"
+PY_ARGS=()
+[[ "$REQUIRED_MODE" == "true" ]] && PY_ARGS+=(--required)
+
+"$PYTHON_BIN" "$ENTRY_POINT" "${PY_ARGS[@]}"

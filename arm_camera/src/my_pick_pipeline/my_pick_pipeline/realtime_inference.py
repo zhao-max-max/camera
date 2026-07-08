@@ -9,13 +9,16 @@
 """
 
 import os
+import sys
 import time
+import argparse
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 from ultralytics import YOLO
 
 import rclpy
+from rclpy.utilities import remove_ros_args
 from geometry_msgs.msg import PoseStamped
 import math
 
@@ -57,6 +60,19 @@ POSE_STALE_SEC = 1.0  # 缓存位姿有效期（秒），超过此时间视为�
 TARGET_FRAME = "world"          # 目标坐标系（arm 的 world）
 SOURCE_FRAME = "camera_link"    # 相机检测结果所在坐标系
 TF_TIMEOUT_SEC = 0.2            # lookup_transform 等待超时
+
+def parse_cli_args():
+    """解析节点自身的命令行参数(ROS 相关参数已被剥离)。
+
+    默认持续实时推理，服务请求只读取最近一次缓存位姿；
+    --required 指定后切换为按需推理(收到服务请求才推理一次)。
+    """
+    argv = remove_ros_args(args=sys.argv)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--required', action='store_true',
+                         help='按需推理；不加则默认持续实时推理')
+    return parser.parse_args(argv[1:])
+
 
 def rotmat2quat(R):
     m00, m01, m02 = R[0,0], R[0,1], R[0,2]
@@ -109,13 +125,20 @@ class RealSenseCamera:
         print("✓ RealSense started")
 
     def read(self):
-        frames = self.pipeline.wait_for_frames()
+        try:
+            frames = self.pipeline.wait_for_frames(5000)
+        except RuntimeError as e:
+            print(f"✗ RealSense frame timeout: {e}")
+            return None, None
         frames = self.align.process(frames)
         c = frames.get_color_frame()
         d = frames.get_depth_frame()
         if not c or not d:
             return None, None
-        return np.asanyarray(c.get_data()), np.asanyarray(d.get_data())
+        # .copy(): get_data() 是指向 SDK 内部帧缓冲区的零拷贝视图，不复制的话
+        # 只要返回的数组还被引用（推理耗时越长引用越久），SDK 的帧内存池就还不回去，
+        # 持续推理场景下几轮之后帧池耗尽，wait_for_frames 会彻底等不到新帧。
+        return np.asanyarray(c.get_data()).copy(), np.asanyarray(d.get_data()).copy()
 
     def stop(self):
         self.pipeline.stop()
@@ -649,6 +672,8 @@ def get_largest_mask_from_result(result, thresh=MASK_THRESH):
 
 
 def main(args=None):
+    cli_args = parse_cli_args()
+
     if not os.path.exists(MODEL_PATH):
         print(f"✗ model not found: {MODEL_PATH}")
         return
@@ -665,8 +690,118 @@ def main(args=None):
         'vis': None,
     }
 
-    # 定义服务回调函数：收到请求时才进行一次推理
+    # 对一帧彩色+深度图执行一次完整推理：模型推理→平面拟合→角点检测→位姿计算。
+    # 成功时发布到 /surface_pose 并写入 global_state 缓存，返回 (pose_msg, vis)；
+    # 任一环节失败返回 (None, None)。按需模式和实时模式共用这份逻辑。
+    def run_inference(color, depth, capture_stamp):
+        t0 = time.monotonic()
+        result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
+        infer_ms = (time.monotonic() - t0) * 1000
+        mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
+        if mask_u8 is None:
+            return None, None
+
+        pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
+        if pts3d is None:
+            return None, None
+        plane = estimator.ransac_plane(pts3d)
+        if plane is None:
+            return None, None
+
+        origin, normal = plane
+        corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
+        corners = estimator.temporal_stabilize_corners(corners)
+        corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
+        axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
+
+        x_axis_ref = np.array([1.0, 0.0, 0.0])
+        angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
+        angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
+        min_angle = min(angle_u, angle_v)
+
+        ys_m, xs_m = np.where(mask_u8 > 0)
+        cx_px = float(np.mean(xs_m))
+        cy_px = float(np.mean(ys_m))
+        centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
+        mask_centroid_uv = None
+        if centroid_3d is not None:
+            dc = centroid_3d - origin
+            mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
+
+        center_3d, _ = estimator.compute_center_from_corner_count(
+            corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
+        if center_3d is None:
+            return None, None
+
+        n_hat = normal / (np.linalg.norm(normal) + 1e-8)
+        R = np.column_stack((axis_u, axis_v, n_hat))
+        q = rotmat2quat(R)
+
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = capture_stamp.to_msg()
+        pose_msg.header.frame_id = SOURCE_FRAME
+        pose_msg.pose.position.x = float(center_3d[0])
+        pose_msg.pose.position.y = float(center_3d[1])
+        pose_msg.pose.position.z = float(center_3d[2])
+        pose_msg.pose.orientation.x = float(q[0])
+        pose_msg.pose.orientation.y = float(q[1])
+        pose_msg.pose.orientation.z = float(q[2])
+        pose_msg.pose.orientation.w = float(q[3])
+
+        if cli_args.required:
+            transformed = False
+            last_tf_err = None
+            for query_time, tag in ((capture_stamp, "exact"), (Time(), "latest")):
+                try:
+                    tf = tf_buffer.lookup_transform(
+                        TARGET_FRAME, SOURCE_FRAME, query_time,
+                        timeout=Duration(seconds=TF_TIMEOUT_SEC))
+                    world_pose = do_transform_pose(pose_msg.pose, tf)
+                    pose_msg.pose = world_pose
+                    pose_msg.header.frame_id = TARGET_FRAME
+                    transformed = True
+                    break
+                except Exception as e:
+                    last_tf_err = e
+            if not transformed:
+                node.get_logger().warn(
+                    f"TF {TARGET_FRAME}<-{SOURCE_FRAME} unavailable ({last_tf_err}); keeping {SOURCE_FRAME} frame")
+
+        pose_pub.publish(pose_msg)
+        global_state['pose'] = pose_msg
+        global_state['last_success_time'] = time.monotonic()
+
+        vis = color.copy()
+        vis = estimator.draw_mask_overlay(vis, mask_u8)
+        vis = estimator.draw_corners(vis, corners)
+        vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
+        global_state['vis'] = vis
+
+        node.get_logger().info(
+            f'Inference OK | time={infer_ms:.0f}ms | '
+            f'xyz=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}) | '
+            f'corners={len(corners_3d)} | min_angle={min_angle:.1f}°')
+        return pose_msg, vis
+
+    # 定义服务回调函数：
+    # - 实时模式(默认)：推理已在主循环里持续进行，服务只读取最近一次缓存位姿，
+    #   超过 POSE_STALE_SEC 视为过期。
+    # - 按需模式(--required)：收到请求时读一帧、跑一次 run_inference。
     def handle_get_pick_pose(request, response):
+        if not cli_args.required:
+            age = time.monotonic() - global_state['last_success_time']
+            if global_state['pose'] is not None and age < POSE_STALE_SEC:
+                response.pick_pose = global_state['pose']
+                response.success = True
+                node.get_logger().info(
+                    f'Service called for {request.object_name}: returning cached pose (age={age:.2f}s)')
+            else:
+                response.pick_pose = PoseStamped()
+                response.success = False
+                node.get_logger().warn(
+                    f'Service called for {request.object_name}: no fresh cached pose (age={age:.2f}s)')
+            return response
+
         node.get_logger().info(f'Service called for {request.object_name}: running inference...')
         color, depth = cam.read()
         if color is None:
@@ -676,99 +811,14 @@ def main(args=None):
             return response
 
         capture_stamp = node.get_clock().now()
-        t0 = time.monotonic()
-        result = model.predict(source=color, conf=CONFIDENCE, iou=IOU, device=DEVICE, verbose=False)[0]
-        infer_ms = (time.monotonic() - t0) * 1000
-        mask_u8 = get_largest_mask_from_result(result, MASK_THRESH)
-
-        vis = color.copy()
-        corners = []
-        center_3d = None
-        axis_u, axis_v, normal = None, None, None
-
-        if mask_u8 is not None:
-            pts3d = estimator.extract_mask_points_3d(mask_u8, depth)
-            if pts3d is not None:
-                plane = estimator.ransac_plane(pts3d)
-                if plane is not None:
-                    origin, normal = plane
-                    corners = estimator.extract_visible_right_angle_vertices(mask_u8, origin, normal)
-                    corners = estimator.temporal_stabilize_corners(corners)
-                    corners_3d = estimator.corners_px_to_3d(corners, origin, normal)
-                    axis_u, axis_v = estimator.estimate_uv_axes(corners_3d, normal)
-
-                    x_axis_ref = np.array([1.0, 0.0, 0.0])
-                    angle_u = np.degrees(np.arccos(np.clip(abs(np.dot(axis_u, x_axis_ref)), 0.0, 1.0)))
-                    angle_v = np.degrees(np.arccos(np.clip(abs(np.dot(axis_v, x_axis_ref)), 0.0, 1.0)))
-                    min_angle = min(angle_u, angle_v)
-
-                    ys_m, xs_m = np.where(mask_u8 > 0)
-                    cx_px = float(np.mean(xs_m))
-                    cy_px = float(np.mean(ys_m))
-                    centroid_3d = estimator.ray_plane_point(cx_px, cy_px, origin, normal)
-                    mask_centroid_uv = None
-                    if centroid_3d is not None:
-                        dc = centroid_3d - origin
-                        mask_centroid_uv = np.array([np.dot(dc, axis_u), np.dot(dc, axis_v)], dtype=np.float64)
-
-                    center_3d, _ = estimator.compute_center_from_corner_count(
-                        corners_3d, origin, axis_u, axis_v, mask_centroid_uv, mask_u8=mask_u8, plane_normal=normal)
-
-                    if center_3d is not None:
-                        n_hat = normal / (np.linalg.norm(normal) + 1e-8)
-                        R = np.column_stack((axis_u, axis_v, n_hat))
-                        q = rotmat2quat(R)
-
-                        pose_msg = PoseStamped()
-                        pose_msg.header.stamp = capture_stamp.to_msg()
-                        pose_msg.header.frame_id = SOURCE_FRAME
-                        pose_msg.pose.position.x = float(center_3d[0])
-                        pose_msg.pose.position.y = float(center_3d[1])
-                        pose_msg.pose.position.z = float(center_3d[2])
-                        pose_msg.pose.orientation.x = float(q[0])
-                        pose_msg.pose.orientation.y = float(q[1])
-                        pose_msg.pose.orientation.z = float(q[2])
-                        pose_msg.pose.orientation.w = float(q[3])
-
-                        transformed = False
-                        last_tf_err = None
-                        for query_time, tag in ((capture_stamp, "exact"), (Time(), "latest")):
-                            try:
-                                tf = tf_buffer.lookup_transform(
-                                    TARGET_FRAME, SOURCE_FRAME, query_time,
-                                    timeout=Duration(seconds=TF_TIMEOUT_SEC))
-                                world_pose = do_transform_pose(pose_msg.pose, tf)
-                                pose_msg.pose = world_pose
-                                pose_msg.header.frame_id = TARGET_FRAME
-                                transformed = True
-                                break
-                            except Exception as e:
-                                last_tf_err = e
-                        if not transformed:
-                            node.get_logger().warn(
-                                f"TF {TARGET_FRAME}<-{SOURCE_FRAME} unavailable ({last_tf_err}); keeping {SOURCE_FRAME} frame")
-
-                        pose_pub.publish(pose_msg)
-                        global_state['pose'] = pose_msg
-                        global_state['last_success_time'] = time.monotonic()
-
-                        vis = estimator.draw_mask_overlay(vis, mask_u8)
-                        vis = estimator.draw_corners(vis, corners)
-                        vis = estimator.draw_uv_axes_and_center(vis, center_3d, axis_u, axis_v, normal=normal, min_angle=min_angle)
-                        global_state['vis'] = vis
-
-                        response.pick_pose = pose_msg
-                        response.success = True
-                        node.get_logger().info(
-                            f'Service: inference OK | '
-                            f'time={infer_ms:.0f}ms | '
-                            f'xyz=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}) | '
-                            f'corners={len(corners_3d)} | min_angle={min_angle:.1f}°')
-                        return response
-
-        response.pick_pose = PoseStamped()
-        response.success = False
-        node.get_logger().warn('Service: inference produced no valid pose.')
+        pose_msg, _ = run_inference(color, depth, capture_stamp)
+        if pose_msg is not None:
+            response.pick_pose = pose_msg
+            response.success = True
+        else:
+            response.pick_pose = PoseStamped()
+            response.success = False
+            node.get_logger().warn('Service: inference produced no valid pose.')
         return response
 
     # 创建服务端，服务名完全匹配现有 C++ 的请求 "get_pick_pos"
@@ -787,16 +837,27 @@ def main(args=None):
     model = YOLO(MODEL_PATH)
     estimator = PlaneAndCornerEstimator(cam.intr, cam.depth_scale)
 
-    print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+    if cli_args.required:
+        print("\nOn-demand inference mode: 推理仅在收到服务请求时触发. Press q to quit.")
+    else:
+        print("\nRealtime inference mode: 持续推理，服务请求直接返回最新缓存位姿. Press q to quit.")
 
     VIS_DISPLAY_SEC = 0.8  # 推理结果展示时长，之后恢复实时画面
+    SPIN_TIMEOUT_SEC = 0.02 if cli_args.required else 0.005
 
     try:
         while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.02)
+            rclpy.spin_once(node, timeout_sec=SPIN_TIMEOUT_SEC)
+
+            color = None
+            if not cli_args.required or not os.environ.get('HEADLESS'):
+                color, depth = cam.read()
+
+            if not cli_args.required and color is not None:
+                capture_stamp = node.get_clock().now()
+                run_inference(color, depth, capture_stamp)
 
             if not os.environ.get('HEADLESS'):
-                color, _ = cam.read()
                 if color is not None:
                     age = time.monotonic() - global_state['last_success_time']
                     if global_state['vis'] is not None and age < VIS_DISPLAY_SEC:
